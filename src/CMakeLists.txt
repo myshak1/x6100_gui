@@ -31,6 +31,7 @@ target_sources(${PROJECT_NAME} PUBLIC
     voice.cpp cw_tune_ui.c adif.c qso_log.c scheduler.cpp
     format.c msg_cw_store.c
     dialog_wifi.c wifi.cpp controls.cpp usb_devices.cpp
+    bt_audio.c
     knobs.cpp lock_manager.c indicators.cpp freq_info.cpp
 )
 
