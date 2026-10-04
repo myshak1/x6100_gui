@@ -5,7 +5,8 @@
  *
  *  Emits WSJT-X UDP messages (schema 3) so that GridTracker, JTAlert,
  *  Log4OM and friends can consume decodes from the radio's built-in
- *  FT8/FT4 application over WiFi.
+ *  FT8/FT4 application over WiFi - and, through bt_spp.c, to a phone
+ *  over Bluetooth SPP.
  *
  *  Config file: /mnt/ft8_udp.conf   (created with defaults on first run,
  *  UDP enabled)
@@ -16,8 +17,8 @@
  *      port=2237
  *      id=X6100
  *
- *  ft8_udp_is_enabled() / ft8_udp_set_enabled() are there for an On/Off
- *  switch in the UI; they work with the FT8 window closed too.
+ *  ft8_udp_is_enabled() / ft8_udp_set_enabled() back the UDP switch in
+ *  the Bluetooth window; they work with the FT8 window closed too.
  */
 
 #pragma once

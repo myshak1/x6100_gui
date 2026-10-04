@@ -6,6 +6,9 @@
 
 #include "ft8_udp.h"
 
+#include "bt_ctl.h"
+#include "bt_spp.h"
+
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
@@ -42,8 +45,8 @@ typedef struct {
 static int      sock_fd  = -1;
 static bool     enabled  = false;
 /* True between ft8_udp_init() and ft8_udp_deinit(), i.e. while the FT8
- * window is open. Outside that a UI switch may still read and flip the
- * UDP setting; it then works on the config file only. */
+ * window is open. Outside that the Bluetooth window may still read and
+ * flip the UDP switch; it then works on the config file only. */
 static bool     running  = false;
 static char     host[64] = "239.255.0.0,gateway";
 static uint16_t port     = 2237;
@@ -134,19 +137,28 @@ static void qb_header(qbuf_t *b, uint32_t msg_type) {
     qb_str(b, wsjt_id);
 }
 
-/* Every emitter returns at once unless the datagram has somewhere to go,
- * so the hooks in the FT8 window cost nothing with UDP off. */
+/* Every emitter returns at once unless the datagram has somewhere to go:
+ * UDP, or a phone on Bluetooth SPP (bt_spp.c), which carries the same
+ * datagrams and has to work with UDP off. So the hooks in the FT8 window
+ * cost nothing when nobody listens. */
 static bool emitters_on(void) {
-    return enabled && sock_fd >= 0;
+    return (enabled && sock_fd >= 0) ||
+           (bt_spp_state() == BT_SPP_CONNECTED);
 }
 
 static void qb_send(qbuf_t *b) {
     if (b->overflow || b->len == 0 || !emitters_on()) return;
 
-    for (int i = 0; i < dest_n; i++) {
-        sendto(sock_fd, b->data, b->len, 0,
-               (struct sockaddr *)&dest[i], sizeof(dest[i]));
+    if (enabled && sock_fd >= 0) {
+        for (int i = 0; i < dest_n; i++) {
+            sendto(sock_fd, b->data, b->len, 0,
+                   (struct sockaddr *)&dest[i], sizeof(dest[i]));
+        }
     }
+
+    /* Queued for the SPP thread; returns at once when no phone is
+     * connected. */
+    bt_spp_send(b->data, b->len);
 }
 
 /* ==================================================================== *
@@ -177,7 +189,7 @@ static void conf_read(void) {
          * harmless on any network - with no listener the datagrams are
          * simply dropped - and an image handed to someone else should
          * work without editing files over SSH. Setting enabled=0 here,
-         * or ft8_udp_set_enabled(false) from a UI switch, turns it off. */
+         * or the UDP switch in the Bluetooth window, turns it off. */
         enabled = true;
         conf_write();
         return;
@@ -314,10 +326,16 @@ void ft8_udp_init(void) {
     running = true;
     conf_read();
     socket_open();
+    /* The Bluetooth bridge carries the same datagrams, so it lives and
+     * dies with this module rather than needing its own hook in
+     * main_screen.c. It reads /mnt/bt.conf and brings the adapter and
+     * the SPP server up only if the Bluetooth window left them on. */
+    bt_ctl_init();
 }
 
 void ft8_udp_deinit(void) {
     running = false;
+    bt_ctl_deinit();
     if (sock_fd >= 0) {
         close(sock_fd);
         sock_fd = -1;
