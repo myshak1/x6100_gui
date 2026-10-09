@@ -3,8 +3,9 @@
  *
  * Bring-up is done by /usr/bin/bt_up.sh (rootfs overlay) rather than in
  * C: the sequence is a pile of small tools with timing between them, and
- * a shell runs it the way it was tested at a prompt. Status is read straight from the kernel with hci_devinfo(),
- * not by parsing hciconfig output.
+ * a shell runs it the way it was tested at a prompt. Status is read
+ * straight from the kernel with hci_devinfo(), not by parsing hciconfig
+ * output.
  */
 
 #include "bt_ctl.h"
@@ -15,7 +16,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <bluetooth/bluetooth.h>
@@ -43,6 +47,8 @@ static struct {
     bool            quit;
     bool            want_on;
     bool            pending;
+    bool            lost;       /* chip lost power: down without saving */
+    bool            discoverable; /* cached by the worker, see below */
 
     bt_ctl_state_t  state;
     char            addr[18];
@@ -55,6 +61,8 @@ static struct {
 };
 
 /* ------------------------------------------------------------------ */
+
+static void ctl_log(const char *fmt, ...);
 
 static void conf_load(void)
 {
@@ -81,6 +89,7 @@ static void conf_load(void)
     fclose(f);
 
     if (enabled) {
+        ctl_log("start: bt.conf enabled=1, Bluetooth on");
         S.want_on = true;
         S.pending = true;
     }
@@ -99,15 +108,49 @@ static void conf_save(bool enabled)
     fclose(f);
 }
 
+/* What the adapter's On/Off did, and why it failed. /mnt is the SD
+ * card's FAT partition: readable on a PC, survives a restart. */
+#define CTL_LOG     "/mnt/bt_ctl.log"
+#define CTL_LOG_MAX 131072
+
+static void ctl_log(const char *fmt, ...)
+{
+    struct stat st;
+    struct tm   tm;
+    time_t      now = time(NULL);
+    char        ts[24];
+    va_list     ap;
+    FILE       *f;
+
+    f = fopen(CTL_LOG,
+              (stat(CTL_LOG, &st) == 0 && st.st_size > CTL_LOG_MAX) ? "w" : "a");
+    if (f == NULL) {
+        return;
+    }
+    localtime_r(&now, &tm);
+    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm);
+    fprintf(f, "%s ", ts);
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fclose(f);
+}
+
 /* Runs a script the way a shell would and waits for it. Called only from
- * the worker thread, never from the UI thread. */
+ * the worker thread, never from the UI thread. The script's own messages
+ * (bt_up: ...) go to the same log. */
 static bool run_script(const char *path, const char *arg)
 {
-    char cmd[256];
+    char cmd[320];
     int  rc;
 
-    snprintf(cmd, sizeof(cmd), "%s '%s' %d >/dev/null 2>&1", path, arg, BT_CHANNEL);
+    ctl_log("run %s", path);
+    snprintf(cmd, sizeof(cmd), "%s '%s' %d >>" CTL_LOG " 2>&1", path, arg, BT_CHANNEL);
     rc = system(cmd);
+    if (rc != 0) {
+        ctl_log("%s failed (status %d)", path, rc);
+    }
     return (rc == 0);
 }
 
@@ -157,13 +200,20 @@ static void *worker(void *arg)
 
         if (on) {
             bool ok = run_script(BT_UP, S.name);
+            bool disc = false;
             char addr[18] = "";
 
             if (ok) {
-                ok = adapter_info(addr, sizeof(addr), NULL);
+                ok = adapter_info(addr, sizeof(addr), &disc);
+                if (!ok) {
+                    ctl_log("adapter_info: hci0 not up");
+                }
             }
             if (ok) {
                 ok = bt_spp_start(BT_CHANNEL);
+                if (!ok) {
+                    ctl_log("SPP server on channel %d did not start: %s", BT_CHANNEL, strerror(errno));
+                }
             }
 
             pthread_mutex_lock(&S.lock);
@@ -174,20 +224,36 @@ static void *worker(void *arg)
                 continue;
             }
             snprintf(S.addr, sizeof(S.addr), "%s", addr);
+            S.discoverable = ok && disc;
             S.state = ok ? BT_CTL_ON : BT_CTL_FAILED;
             pthread_mutex_unlock(&S.lock);
-            conf_save(ok);
+            ctl_log("on: %s", ok ? "ok" : "FAILED");
+            /* Only a success is remembered. A failed start used to save
+             * enabled=0, so the radio came up with Bluetooth off after a
+             * restart that the operator never asked for. */
+            if (ok) {
+                conf_save(true);
+            }
         } else {
+            bool lost;
+
             bt_spp_stop();
             run_script(BT_DOWN, S.name);
 
             pthread_mutex_lock(&S.lock);
             S.addr[0] = '\0';
+            S.discoverable = false;
             if (!S.pending) {
                 S.state = BT_CTL_OFF;
             }
+            lost = S.lost;
+            S.lost = false;
             pthread_mutex_unlock(&S.lock);
-            conf_save(false);
+            /* Switched off by the operator: remembered across reboots.
+             * Lost with the chip's power: the saved choice stays. */
+            if (!lost) {
+                conf_save(false);
+            }
         }
     }
 
@@ -250,6 +316,7 @@ void bt_ctl_deinit(void)
 void bt_ctl_request(bool on)
 {
     ensure_thread();
+    ctl_log("request: Bluetooth %s", on ? "on" : "off");
 
     pthread_mutex_lock(&S.lock);
     S.want_on = on;
@@ -266,6 +333,20 @@ bt_ctl_state_t bt_ctl_state(void)
 
     pthread_mutex_lock(&S.lock);
     st = S.state;
+    /* WiFi switched off in the WiFi window cuts power to the shared
+     * chip and hci0 disappears under us. Say Off and let the worker stop
+     * the SPP server and tidy up, instead of showing On for a dead
+     * adapter. One stat() of a sysfs entry, cheap enough per call. */
+    if (st == BT_CTL_ON && !S.pending &&
+        access("/sys/class/bluetooth/hci0", F_OK) != 0) {
+        ctl_log("hci0 gone from sysfs: chip lost power, Bluetooth off");
+        S.want_on = false;
+        S.pending = true;
+        S.lost = true;
+        S.addr[0] = '\0';
+        S.state = st = BT_CTL_OFF;
+        pthread_cond_signal(&S.cond);
+    }
     pthread_mutex_unlock(&S.lock);
     return st;
 }
@@ -291,12 +372,20 @@ void bt_ctl_set_name(const char *name)
     conf_save(bt_ctl_state() == BT_CTL_ON);
 }
 
+/* Cached: never asks the kernel from here. This is called by the
+ * Bluetooth window's timer on the GUI thread, and it used to run
+ * hci_devinfo() - socket, ioctl, close - right there. With a phone
+ * reconnecting next to a headset the kernel's Bluetooth stack stalled
+ * and that close() blocked in __lock_sock in uninterruptible sleep:
+ * the whole radio froze, only a power cycle helped. The worker thread
+ * reads the flag when it brings the adapter up (bt_up.sh makes it
+ * discoverable and keeps it so). */
 bool bt_ctl_discoverable(void)
 {
-    bool disc = false;
+    bool disc;
 
-    if (!adapter_info(NULL, 0, &disc)) {
-        return false;
-    }
+    pthread_mutex_lock(&S.lock);
+    disc = S.discoverable;
+    pthread_mutex_unlock(&S.lock);
     return disc;
 }

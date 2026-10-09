@@ -32,8 +32,9 @@ target_sources(${PROJECT_NAME} PUBLIC
     voice.cpp cw_tune_ui.c adif.c qso_log.c scheduler.cpp
     format.c msg_cw_store.c
     dialog_wifi.c wifi.cpp controls.cpp usb_devices.cpp
-    dialog_bt.c bt_audio.c bt_ctl.c bt_dev.c bt_spp.c
+    bt_audio.c
     knobs.cpp lock_manager.c indicators.cpp freq_info.cpp
+    dialog_bt.c bt_ctl.c bt_dev.c bt_spp.c
 )
 
 add_subdirectory(fonts)

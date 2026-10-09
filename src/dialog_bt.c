@@ -29,7 +29,7 @@
  *  Pairing is part of Connect (bt_dev pairs first when needed). Forget
  *  removes the pairing; it acts on hold only, a press just says so.
  *
- *  Nothing here blocks. Every bluetoothctl and pactl call belongs to
+ *  Nothing here blocks. Every D-Bus and pactl call belongs to
  *  bt_dev or bt_audio and runs on their worker threads; this file only
  *  reads cached values and asks for work.
  */
@@ -46,6 +46,8 @@
 #include "msg.h"
 #include "radio.h"
 #include "styles.h"
+#include "wifi.h"
+#include "cfg/cfg_api.h"
 
 #include "bt_audio.h"
 #include "bt_ctl.h"
@@ -60,8 +62,8 @@
  * uses. */
 #define PARAMS_WIDTH  300
 
-/* bluetoothctl forks three processes per refresh, so it does not get to
- * run every tick. pactl is lighter but still not free. */
+/* A device refresh is a D-Bus round trip plus one pactl, so it does not
+ * get to run every tick. pactl is not free either. */
 #define TICK_MS       1000
 #define DEV_EVERY     3
 #define AUDIO_EVERY   2
@@ -256,7 +258,11 @@ static void status_refresh(void)
                                                         : "Hidden");
             break;
         default:
-            lv_label_set_text(label_adapter, "Off");
+            /* WiFi off in the WiFi window cuts power to the shared
+             * WiFi/BT chip; BT On powers it up again. */
+            lv_label_set_text(label_adapter,
+                              param_i_get(cfg.network.wifi_enabled())
+                                  ? "Off" : "Off\nWiFi/BT chip off");
             break;
     }
 
@@ -455,8 +461,18 @@ static void bt_toggle_cb(button_data_t *item)
     bt_ctl_state_t st = bt_ctl_state();
 
     if (st == BT_CTL_OFF || st == BT_CTL_FAILED) {
+        /* WiFi and Bluetooth are one chip on one power pin
+         * (x6100_pin_wifi). With WiFi switched off in the WiFi window
+         * the chip is unpowered, hci0 never appears and bt_up.sh used to
+         * give up after 30 s with "Error". Power it up first, the way
+         * the WiFi window does; bt_up.sh waits for hci0. */
+        if (!param_i_get(cfg.network.wifi_enabled())) {
+            wifi_power_on();
+            msg_update_text_fmt("Bluetooth on - powering up the WiFi/BT chip");
+        } else {
+            msg_update_text_fmt("Bluetooth on");
+        }
         bt_ctl_request(true);
-        msg_update_text_fmt("Bluetooth on");
     } else {
         /* The loopbacks feed and read a headset that is about to
          * disappear. */

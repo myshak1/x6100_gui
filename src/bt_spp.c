@@ -93,18 +93,63 @@ static void queue_clear(void)
     S.out_off = 0;
 }
 
-/* Caller holds the lock. */
-static void close_client(void)
+/*
+ * Closing an RFCOMM socket can block in the kernel (__lock_sock, in
+ * uninterruptible sleep) when the Bluetooth stack is busy - seen with a
+ * phone reconnecting next to a headset. So no Bluetooth socket is ever
+ * closed with S.lock held (the GUI thread takes S.lock for every frame
+ * it queues), and the GUI thread never closes one itself: bt_spp_stop()
+ * hands them to a short-lived detached thread.
+ */
+static void *closer_thread(void *arg)
 {
-    if (S.cli >= 0) {
-        close(S.cli);
-        S.cli = -1;
+    int *fds = arg;
+    int  i;
+
+    for (i = 0; fds[i] != -2; i++) {
+        if (fds[i] >= 0) {
+            close(fds[i]);
+        }
     }
+    free(fds);
+    return NULL;
+}
+
+/* Closes up to three descriptors in the background. */
+static void close_async(int a, int b, int c)
+{
+    pthread_t      t;
+    pthread_attr_t at;
+    int           *fds = malloc(4 * sizeof(int));
+
+    if (fds == NULL) {
+        return;     /* leak the descriptors rather than block */
+    }
+    fds[0] = a;
+    fds[1] = b;
+    fds[2] = c;
+    fds[3] = -2;
+    pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&t, &at, closer_thread, fds) != 0) {
+        free(fds);
+    }
+    pthread_attr_destroy(&at);
+}
+
+/* Caller holds the lock. Detaches the client and returns its descriptor
+ * for the caller to close AFTER unlocking (-1 if there was none). */
+static int close_client(void)
+{
+    int fd = S.cli;
+
+    S.cli = -1;
     S.peer[0] = '\0';
     queue_clear();
     if (S.state == BT_SPP_CONNECTED) {
         S.state = BT_SPP_LISTENING;
     }
+    return fd;
 }
 
 static void wake_worker(void)
@@ -283,9 +328,14 @@ static void *worker(void *arg)
                 alive = flush_output();
             }
             if (!alive) {
+                int fd;
+
                 pthread_mutex_lock(&S.lock);
-                close_client();
+                fd = close_client();
                 pthread_mutex_unlock(&S.lock);
+                if (fd >= 0) {
+                    close(fd);      /* worker thread, lock released */
+                }
             }
         }
     }
@@ -387,20 +437,27 @@ void bt_spp_stop(void)
         S.thread_valid = false;
     }
 
-    pthread_mutex_lock(&S.lock);
-    close_client();
-    if (S.srv >= 0) {
-        close(S.srv);
+    {
+        int cli;
+        int srv;
+
+        pthread_mutex_lock(&S.lock);
+        cli = close_client();
+        srv = S.srv;
         S.srv = -1;
+        if (S.wake[0] >= 0) {
+            close(S.wake[0]);       /* a pipe: never blocks */
+            close(S.wake[1]);
+            S.wake[0] = S.wake[1] = -1;
+        }
+        queue_clear();
+        S.state = BT_SPP_STOPPED;
+        pthread_mutex_unlock(&S.lock);
+
+        /* May run on the GUI thread (FT8 window closing): the RFCOMM
+         * sockets are closed in the background. */
+        close_async(cli, srv, -1);
     }
-    if (S.wake[0] >= 0) {
-        close(S.wake[0]);
-        close(S.wake[1]);
-        S.wake[0] = S.wake[1] = -1;
-    }
-    queue_clear();
-    S.state = BT_SPP_STOPPED;
-    pthread_mutex_unlock(&S.lock);
 }
 
 bt_spp_state_t bt_spp_state(void)

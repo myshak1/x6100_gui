@@ -3,6 +3,10 @@
  *
  * Listening: a PulseAudio loopback from the radio's capture device to
  * the Bluetooth sink (A2DP, or HFP once PTT has been used).
+ * While it plays into connected headphones the radio's own speaker is
+ * silent and the VOL knob (and mute) set the headphone volume, through
+ * radio_set_volume_sink(). If the headphones go away the speaker comes
+ * back, and listening resumes by itself when they reconnect.
  *
  * PTT: the headset microphone goes to the radio's transmitter. The card
  * is switched to HFP (handsfree_head_unit), a second loopback carries
@@ -27,6 +31,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -97,6 +102,15 @@ int bt_audio_set_mic_gain(int db);
  * HCI monitor channel, see bt_audio.c). /mnt/bt_audio.conf
  * headset_ptt=0 turns it off; on by default. */
 bool bt_audio_headset_ptt(void);
+
+/* Local playback (TTS, voice message preview, recordings). While
+ * listening plays into connected headphones, copies the Bluetooth sink
+ * name into `sink`, mutes the listening loopback and returns true: open
+ * the player on that sink (audio_create_player_on()) instead of using
+ * AUDIO_PLAY_ON, and call bt_audio_playback_end() when done. Returns
+ * false otherwise: play locally as before. Never blocks. */
+bool bt_audio_playback_begin(char *sink, size_t sink_sz);
+void bt_audio_playback_end(void);
 
 #ifdef __cplusplus
 }
