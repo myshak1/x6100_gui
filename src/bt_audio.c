@@ -13,25 +13,45 @@
  *
  * PTT: the HFP source of the headset goes through a second loopback
  * into the codec output and the BASE is keyed with radio_set_modem(),
- * exactly like send_thread() in dialog_msg_voice.c. On v1.0.x
+ * exactly like send_thread() in dialog_msg_voice.c.
  * radio_set_ptt() keys the transmitter from the radio's own microphone
  * input, so the codec audio - our headset loopback - never reached the
  * modulator: PTT worked, ALC and power did not move. modem_set takes
  * the TX audio from the codec, as the voice messages and the FT8
  * transmitter do. Record mode (audio_set_play_mode(AUDIO_PLAY_ON), the
- * x6100_voice_rec bit) must NOT be set: dialog_msg_voice.c uses it only for local playback, and
- * the first version, which set it, never went to TX.
+ * x6100_voice_rec bit) must NOT be set: dialog_msg_voice.c uses it only
+ * for local playback, and a version that set it never went to TX.
  *
  * Both loopbacks are loaded with *_dont_move=true. Without it PulseAudio
  * moves an orphaned loopback to the default device when the headset
  * disappears, and the listening loopback would then feed receiver audio
  * straight into the transmitter's input.
  *
+ * Speaker and volume: while the listening loopback plays into
+ * connected headphones (state BT_AUDIO_ON) the radio's own speaker is
+ * kept silent and the volume - VOL knob, the Volume button, CAT and mute
+ * - is handed to the Bluetooth sink through radio_set_volume_sink().
+ * When listening stops or the headphones go away, the speaker gets its
+ * volume back. Listening that lost its headphones (BT_AUDIO_NO_SINK)
+ * starts again by itself when they come back, so the worker keeps an eye
+ * on the sink list every BG_POLL_S seconds even with the window closed.
+ *
+ * Local playback - TTS, the voice message preview, recordings - plays
+ * on the radio's speaker in AUDIO_PLAY_ON mode, where the BASE replaces
+ * the receiver with the GUI's audio. With the speaker silent that would
+ * go nowhere, so while listening is on those players open a stream on
+ * the Bluetooth sink instead (bt_audio_playback_begin()), and the
+ * listening loopback is muted for the time, as the BASE does locally.
+ * begin/end is a flag, not a count, like AUDIO_PLAY_ON/OFF: a cancelled
+ * TTS thread that never called end is put right by the next one.
+ *
  * Headset button: see "Headset button as PTT" at the end of this file.
  */
 
 #include "bt_audio.h"
 
+#include "audio.h"
+#include "cfg/cfg_api.h"
 #include "msg.h"
 #include "radio.h"
 
@@ -41,6 +61,8 @@
 #include <sys/socket.h>
 
 #include <errno.h>
+#include <stdarg.h>
+#include <sys/stat.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -61,9 +83,30 @@
  * syllable less. */
 #define TX_LATENCY_MS   60u
 
+/* Level of the headset microphone into the modulator. The headset
+ * delivers speech well below full scale and the HFP source volume is
+ * the headset's own mic gain (no effect above 100 %), so the gain is
+ * set where the voice messages and FT8 set it: the codec playback
+ * volume, for the time of the transmission. The Play gain from Settings
+ * is put back afterwards. The right value still has to be settled: on
+ * one radio the ALC did not follow the Play gain consistently, so the
+ * default stays at 0 dB until that is understood. */
+#define MIC_GAIN_MIN     (-10)
+#define MIC_GAIN_MAX     10
+#define MIC_GAIN_DEFAULT 0
+
 /* How long to wait for the HFP source after a profile switch. */
 #define HFP_WAIT_STEPS  10
 #define HFP_WAIT_US     400000
+
+/* Background check for the headphones while listening is on or waiting
+ * for them, window open or not. One "pactl list short sinks". */
+#define BG_POLL_S       3
+
+/* cfg.volume runs 0..55 (radio_change_vol). It is mapped linearly onto
+ * the PulseAudio volume scale, which is already perceptual (cubic), as
+ * pactl's percent is. */
+#define RADIO_VOL_MAX   55
 
 typedef enum {
     CMD_NONE = 0,
@@ -87,6 +130,16 @@ static struct {
     uint32_t         measured_ms;
     uint32_t         latency_ms;
     bool             headset_ptt;   /* headset button toggles PTT */
+    int              mic_gain_db;   /* codec play volume while TX */
+
+    /* Volume handed over by radio.c while the speaker is silent. */
+    int              vol_want;      /* 0..RADIO_VOL_MAX, -1 unknown */
+    bool             vol_pending;   /* vol_want not yet sent to the sink */
+    bool             speaker_handed;/* worker only: radio_set_volume_sink on */
+
+    /* Local playback on the headphones: listening loopback muted. */
+    bool             pause_want;
+    bool             pause_applied; /* written by the worker only */
 
     /* PTT. ptt_want is what the UI asked for, ptt_on is what the
      * worker has actually done to the radio. */
@@ -102,6 +155,8 @@ static struct {
     .module_idx    = -1,
     .latency_ms    = LAT_DEFAULT,
     .headset_ptt   = true,
+    .mic_gain_db   = MIC_GAIN_DEFAULT,
+    .vol_want      = -1,
     .ptt_state     = BT_PTT_OFF,
     .tx_module_idx = -1,
 };
@@ -114,6 +169,45 @@ static time_t now_s(void)
 
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec;
+}
+
+/* ---- Log -----------------------------------------------------------
+ *
+ * /mnt is the FAT partition of the SD card, so the log can be read on a
+ * PC without SSH: switch the radio off, put the card in, open
+ * bt_audio.log. Kept below BT_LOG_MAX by moving it to bt_audio.log.old.
+ */
+#define BT_LOG      "/mnt/bt_audio.log"
+#define BT_LOG_OLD  "/mnt/bt_audio.log.old"
+#define BT_LOG_MAX  262144
+
+static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void bt_log(const char *fmt, ...)
+{
+    struct stat st;
+    struct tm   tm;
+    time_t      now = time(NULL);
+    char        ts[24];
+    va_list     ap;
+    FILE       *f;
+
+    pthread_mutex_lock(&log_lock);
+    if (stat(BT_LOG, &st) == 0 && st.st_size > BT_LOG_MAX) {
+        (void)rename(BT_LOG, BT_LOG_OLD);
+    }
+    f = fopen(BT_LOG, "a");
+    if (f != NULL) {
+        localtime_r(&now, &tm);
+        strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm);
+        fprintf(f, "%s ", ts);
+        va_start(ap, fmt);
+        vfprintf(f, fmt, ap);
+        va_end(ap);
+        fputc('\n', f);
+        fclose(f);
+    }
+    pthread_mutex_unlock(&log_lock);
 }
 
 static void conf_load(void)
@@ -133,6 +227,12 @@ static void conf_load(void)
             }
         } else if (strncmp(line, "headset_ptt=", 12) == 0) {
             S.headset_ptt = strtol(line + 12, NULL, 10) != 0;
+        } else if (strncmp(line, "mic_gain_db=", 12) == 0) {
+            long g = strtol(line + 12, NULL, 10);
+
+            if (g >= MIC_GAIN_MIN && g <= MIC_GAIN_MAX) {
+                S.mic_gain_db = (int)g;
+            }
         }
     }
     fclose(f);
@@ -149,6 +249,8 @@ static void conf_save(void)
     fprintf(f, "latency_msec=%u\n", (unsigned)S.latency_ms);
     fprintf(f, "# 1: a short press of the headset button toggles PTT\n");
     fprintf(f, "headset_ptt=%d\n", S.headset_ptt ? 1 : 0);
+    fprintf(f, "# headset microphone level while transmitting, dB (-10..10)\n");
+    fprintf(f, "mic_gain_db=%d\n", S.mic_gain_db);
     fclose(f);
 }
 
@@ -176,10 +278,70 @@ static bool run_capture(const char *cmd, char *out, size_t out_sz)
     return (pclose(p) == 0);
 }
 
+/*
+ * Which Bluetooth device is ours.
+ *
+ * PulseAudio makes sinks, sources and a card for EVERY connected audio
+ * device, phones included. A phone connected for media appears as
+ * bluez_source.<phone>.a2dp_source (its music coming in), connected for
+ * calls as ...handsfree_audio_gateway / headset_audio_gateway. Taking
+ * the first "bluez" entry, as an earlier version did, made PTT transmit
+ * the phone's media stream instead of the speaker's microphone whenever
+ * a phone (one running a WSJT-X client app) was connected as well.
+ *
+ * So only the profiles in which the remote device is a headset or a
+ * speaker count, and the microphone and the card are taken from the
+ * same device (MAC) the listening loopback plays to.
+ */
+static const char *const SINK_PROFILES[] = {
+    ".a2dp_sink", ".handsfree_head_unit", ".headset_head_unit", NULL
+};
+static const char *const MIC_PROFILES[] = {
+    ".handsfree_head_unit", ".headset_head_unit", NULL
+};
+
+static bool ends_with_any(const char *name, const char *const *sfx)
+{
+    size_t n = strlen(name);
+
+    for (; *sfx != NULL; sfx++) {
+        size_t k = strlen(*sfx);
+
+        if (n >= k && strcmp(name + n - k, *sfx) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* "bluez_sink.AA_BB_CC_DD_EE_FF.a2dp_sink" -> "AA_BB_CC_DD_EE_FF",
+ * "bluez_card.AA_BB_CC_DD_EE_FF" -> "AA_BB_CC_DD_EE_FF". */
+static void name_mac(const char *name, char *mac, size_t mac_sz)
+{
+    const char *a = strchr(name, '.');
+    const char *b;
+    size_t      n;
+
+    mac[0] = '\0';
+    if (a == NULL) {
+        return;
+    }
+    a++;
+    b = strchr(a, '.');
+    n = (b != NULL) ? (size_t)(b - a) : strlen(a);
+    if (n == 0 || n >= mac_sz) {
+        return;
+    }
+    memcpy(mac, a, n);
+    mac[n] = '\0';
+}
+
 /* Reads "pactl list short <what>" and returns the name column of the
- * first line containing `must` and not containing `mustnt`. */
-static void find_short(const char *what, const char *must,
-                       const char *mustnt, char *out, size_t out_sz)
+ * first entry that starts with `prefix`, ends with one of `sfx` (NULL:
+ * any) and belongs to `mac` (NULL or "": any device). */
+static void find_dev(const char *what, const char *prefix,
+                     const char *const *sfx, const char *mac,
+                     char *out, size_t out_sz)
 {
     FILE *p;
     char  cmd[64];
@@ -196,6 +358,7 @@ static void find_short(const char *what, const char *must,
     while (fgets(line, sizeof(line), p) != NULL) {
         char *name;
         char *tab;
+        char  m[32];
 
         /* index <tab> name <tab> module ... */
         name = strchr(line, '\t');
@@ -207,11 +370,21 @@ static void find_short(const char *what, const char *must,
         if (tab != NULL) {
             *tab = '\0';
         }
-        if (strstr(name, must) == NULL) {
+        tab = strchr(name, '\n');
+        if (tab != NULL) {
+            *tab = '\0';
+        }
+        if (strncmp(name, prefix, strlen(prefix)) != 0) {
             continue;
         }
-        if (mustnt != NULL && strstr(name, mustnt) != NULL) {
+        if (sfx != NULL && !ends_with_any(name, sfx)) {
             continue;
+        }
+        if (mac != NULL && mac[0] != '\0') {
+            name_mac(name, m, sizeof(m));
+            if (strcmp(m, mac) != 0) {
+                continue;
+            }
         }
         snprintf(out, out_sz, "%s", name);
         break;
@@ -219,27 +392,52 @@ static void find_short(const char *what, const char *must,
     pclose(p);
 }
 
-/* bluez_sink.AA_BB.a2dp_sink, bluez_sink.AA_BB.handsfree_head_unit or
- * the newer bluez_output spelling - whichever profile is active. */
+/* Headphones or speaker to play to: bluez_sink.<MAC>.a2dp_sink, or
+ * .handsfree_head_unit once PTT has switched the card to HFP. The
+ * device already in use is kept if it is still there. */
 static void find_sink(char *out, size_t out_sz)
 {
-    find_short("sinks", "bluez", NULL, out, out_sz);
-}
+    char cur[96];
+    char mac[32];
 
-/* bluez_source.AA_BB.handsfree_head_unit. Exists only in HFP/HSP; the
- * monitor of the A2DP sink is called bluez_sink...monitor and is not
- * matched. */
-static void find_mic(char *out, size_t out_sz)
-{
-    find_short("sources", "bluez_", ".monitor", out, out_sz);
-    if (out[0] != '\0' && strstr(out, "bluez_sink") != NULL) {
-        out[0] = '\0';
+    pthread_mutex_lock(&S.lock);
+    snprintf(cur, sizeof(cur), "%s", S.sink);
+    pthread_mutex_unlock(&S.lock);
+
+    name_mac(cur, mac, sizeof(mac));
+    if (mac[0] != '\0') {
+        find_dev("sinks", "bluez_sink.", SINK_PROFILES, mac, out, out_sz);
+        if (out[0] != '\0') {
+            return;
+        }
     }
+    find_dev("sinks", "bluez_sink.", SINK_PROFILES, NULL, out, out_sz);
 }
 
-static void find_card(char *out, size_t out_sz)
+/* Microphone of the device `mac`: bluez_source.<MAC>.handsfree_head_unit
+ * (HFP/HSP only). Never an a2dp_source - that is a phone's media. */
+static void find_mic(const char *mac, char *out, size_t out_sz)
 {
-    find_short("cards", "bluez_card", NULL, out, out_sz);
+    find_dev("sources", "bluez_source.", MIC_PROFILES, mac, out, out_sz);
+}
+
+static void find_card(const char *mac, char *out, size_t out_sz)
+{
+    out[0] = '\0';
+    if (mac == NULL || mac[0] == '\0') {
+        return;
+    }
+    find_dev("cards", "bluez_card.", NULL, mac, out, out_sz);
+}
+
+/* The device PTT uses: the one listening plays to, else the first
+ * headset or speaker connected. "" when there is none. */
+static void ptt_device(char *mac, size_t mac_sz)
+{
+    char sink[96];
+
+    find_sink(sink, sizeof(sink));
+    name_mac(sink, mac, mac_sz);
 }
 
 /* Adds up the buffer and sink latency of the listening loopback, which
@@ -305,22 +503,67 @@ static void unload_module(int *idx)
     *idx = -1;
 }
 
-static int load_module_loopback(const char *source, const char *sink,
-                                uint32_t latency, const char *tag)
-{
-    char cmd[400];
-    char reply[32];
+/*
+ * Latency creep: every underrun on the Bluetooth side (frequent with
+ * WiFi on the same antenna) makes PulseAudio raise the loopback's
+ * minimum latency ("Sink minimum latency increased to ..."), and it is
+ * never lowered again - after a long listen the delay had grown from
+ * 100 ms to 2 s. max_latency_msec caps how far it may grow and
+ * fast_adjust_threshold_msec makes the loopback drop the excess at once
+ * (a short gap) instead of letting it pile up.
+ */
+#define LOOP_FAST_ADJUST_MS 200u
+#define LOOP_MAX_EXTRA_MS   200u
 
+static int load_one(const char *source, const char *sink, uint32_t latency,
+                    const char *tag, bool capped)
+{
+    char cmd[480];
+    char reply[32];
+    char extra[96] = "";
+
+    if (capped) {
+        snprintf(extra, sizeof(extra),
+                 "max_latency_msec=%u fast_adjust_threshold_msec=%u ",
+                 (unsigned)(latency + LOOP_MAX_EXTRA_MS),
+                 (unsigned)LOOP_FAST_ADJUST_MS);
+    }
     snprintf(cmd, sizeof(cmd),
              "pactl load-module module-loopback source=%s sink=%s "
-             "latency_msec=%u source_dont_move=true sink_dont_move=true "
+             "latency_msec=%u %ssource_dont_move=true sink_dont_move=true "
              "sink_input_properties=media.name=%s 2>/dev/null",
-             source, sink, (unsigned)latency, tag);
+             source, sink, (unsigned)latency, extra, tag);
 
     if (!run_capture(cmd, reply, sizeof(reply)) || reply[0] == '\0') {
         return -1;
     }
     return (int)strtol(reply, NULL, 10);
+}
+
+static int load_module_loopback(const char *source, const char *sink,
+                                uint32_t latency, const char *tag)
+{
+    static int capped_ok = -1;      /* -1 unknown, 0 not supported, 1 ok */
+    int        idx = -1;
+
+    if (capped_ok != 0) {
+        idx = load_one(source, sink, latency, tag, true);
+        if (idx >= 0 && capped_ok < 0) {
+            capped_ok = 1;
+            bt_log("loopback: latency cap on (max %u ms, fast adjust %u ms)",
+                   (unsigned)(latency + LOOP_MAX_EXTRA_MS),
+                   (unsigned)LOOP_FAST_ADJUST_MS);
+        }
+    }
+    if (idx < 0) {
+        /* An older module-loopback refuses the unknown arguments. */
+        idx = load_one(source, sink, latency, tag, false);
+        if (idx >= 0 && capped_ok < 0) {
+            capped_ok = 0;
+            bt_log("loopback: this PulseAudio has no latency cap, loaded without");
+        }
+    }
+    return idx;
 }
 
 /* ---- Listening ---------------------------------------------------- */
@@ -344,6 +587,7 @@ static void do_on(void)
     pthread_mutex_unlock(&S.lock);
 
     if (sink[0] == '\0') {
+        bt_log("listen: no headphones or speaker connected");
         set_state(BT_AUDIO_NO_SINK);
         return;
     }
@@ -351,6 +595,7 @@ static void do_on(void)
     unload_module(&S.module_idx);
 
     idx = load_module_loopback(SRC_DEVICE, sink, S.latency_ms, "BTListen");
+    bt_log("listen: %s %s", sink, idx >= 0 ? "on" : "FAILED to load loopback");
     if (idx >= 0) {
         uint32_t ms;
 
@@ -360,6 +605,13 @@ static void do_on(void)
         pthread_mutex_lock(&S.lock);
         S.measured_ms = ms;
         S.state = BT_AUDIO_ON;
+        /* A new sink (first start, latency change, A2DP -> HFP) starts
+         * at its own volume: send ours again. */
+        if (S.vol_want >= 0) {
+            S.vol_pending = true;
+        }
+        /* A fresh loopback plays: mute it again if a playback is on. */
+        S.pause_applied = false;
         pthread_mutex_unlock(&S.lock);
     } else {
         set_state(BT_AUDIO_FAILED);
@@ -376,7 +628,9 @@ static void do_off(void)
     pthread_mutex_unlock(&S.lock);
 }
 
-static void do_poll(void)
+/* measure: also read the loopback delay for the window. The background
+ * check passes false and only looks at the sink list. */
+static void do_poll(bool measure)
 {
     char             sink[96];
     uint32_t         ms = 0;
@@ -389,6 +643,15 @@ static void do_poll(void)
     snprintf(S.sink, sizeof(S.sink), "%s", sink);
     pthread_mutex_unlock(&S.lock);
 
+    /* Listening was asked for, the headphones were missing: they are
+     * back, start playing to them. */
+    if (st == BT_AUDIO_NO_SINK) {
+        if (sink[0] != '\0') {
+            do_on();
+        }
+        return;
+    }
+
     if (st != BT_AUDIO_ON) {
         return;
     }
@@ -396,6 +659,7 @@ static void do_poll(void)
     /* Headphones walked away: dont_move already unloaded the loopback,
      * so forget its index and say so rather than claiming to play. */
     if (sink[0] == '\0') {
+        bt_log("listen: headphones gone, speaker back");
         unload_module(&S.module_idx);
         pthread_mutex_lock(&S.lock);
         S.measured_ms = 0;
@@ -404,10 +668,147 @@ static void do_poll(void)
         return;
     }
 
+    if (!measure) {
+        return;
+    }
     ms = measure_latency();
     pthread_mutex_lock(&S.lock);
     S.measured_ms = ms;
     pthread_mutex_unlock(&S.lock);
+}
+
+/* ---- Speaker and volume ------------------------------------------ */
+
+/* Called by radio.c with the volume to play at (0 when muted), from the
+ * UI thread or from radio_set_volume_sink(). Only records it; the worker
+ * talks to PulseAudio. Must not block. */
+static void vol_cb(int32_t vol)
+{
+    pthread_mutex_lock(&S.lock);
+    S.vol_want = (int)vol;
+    S.vol_pending = true;
+    pthread_cond_signal(&S.cond);
+    pthread_mutex_unlock(&S.lock);
+}
+
+/* Sends the last volume to the Bluetooth sink. Turning the knob fast
+ * posts many values; only the last one is sent. Worker thread only. */
+static void apply_volume(void)
+{
+    char sink[96];
+    char cmd[200];
+    int  vol;
+    int  pct;
+    bool on;
+
+    pthread_mutex_lock(&S.lock);
+    if (!S.vol_pending) {
+        pthread_mutex_unlock(&S.lock);
+        return;
+    }
+    S.vol_pending = false;
+    vol = S.vol_want;
+    on = (S.state == BT_AUDIO_ON);
+    snprintf(sink, sizeof(sink), "%s", S.sink);
+    pthread_mutex_unlock(&S.lock);
+
+    if (!on || vol < 0 || sink[0] == '\0') {
+        return;
+    }
+    if (vol > RADIO_VOL_MAX) {
+        vol = RADIO_VOL_MAX;
+    }
+    pct = (vol * 100 + RADIO_VOL_MAX / 2) / RADIO_VOL_MAX;
+
+    snprintf(cmd, sizeof(cmd),
+             "pactl set-sink-volume %s %d%% >/dev/null 2>&1", sink, pct);
+    (void)run_capture(cmd, NULL, 0);
+}
+
+/* Speaker silent and volume on the headphones exactly while listening
+ * plays into them. Transitional states keep what there is, so a reload
+ * or the switch to HFP does not blip the speaker. Worker thread only,
+ * never with S.lock held (radio_set_volume_sink calls vol_cb). */
+static void speaker_follow(void)
+{
+    bt_audio_state_t st;
+    bool             want;
+
+    pthread_mutex_lock(&S.lock);
+    st = S.state;
+    pthread_mutex_unlock(&S.lock);
+
+    if (st == BT_AUDIO_STARTING || st == BT_AUDIO_STOPPING) {
+        return;
+    }
+    want = (st == BT_AUDIO_ON);
+    if (want == S.speaker_handed) {
+        return;
+    }
+    S.speaker_handed = want;
+    radio_set_volume_sink(want ? vol_cb : NULL);
+}
+
+/* Index of the sink input the listening loopback plays through, -1 if
+ * not found. "pactl list short sink-inputs": index, sink, owner module,
+ * client, sample spec. */
+static int loopback_input(int module)
+{
+    FILE *p;
+    char  line[256];
+    int   found = -1;
+
+    if (module < 0) {
+        return -1;
+    }
+    p = popen("pactl list short sink-inputs 2>/dev/null", "r");
+    if (p == NULL) {
+        return -1;
+    }
+    while (fgets(line, sizeof(line), p) != NULL) {
+        char *f2 = strchr(line, '\t');
+        char *f3;
+
+        if (f2 == NULL) {
+            continue;
+        }
+        f3 = strchr(f2 + 1, '\t');
+        if (f3 == NULL) {
+            continue;
+        }
+        if (strtol(f3 + 1, NULL, 10) == module && f3[1] >= '0' && f3[1] <= '9') {
+            found = (int)strtol(line, NULL, 10);
+            break;
+        }
+    }
+    pclose(p);
+    return found;
+}
+
+/* Mutes or unmutes the listening loopback to match pause_want. Worker
+ * thread only. */
+static void apply_pause(void)
+{
+    char cmd[80];
+    bool want;
+    int  in;
+
+    pthread_mutex_lock(&S.lock);
+    want = S.pause_want;
+    if (want == S.pause_applied || S.module_idx < 0) {
+        pthread_mutex_unlock(&S.lock);
+        return;
+    }
+    S.pause_applied = want;
+    pthread_mutex_unlock(&S.lock);
+
+    in = loopback_input(S.module_idx);
+    if (in < 0) {
+        return;
+    }
+    snprintf(cmd, sizeof(cmd),
+             "pactl set-sink-input-mute %d %d >/dev/null 2>&1", in, want ? 1 : 0);
+    (void)run_capture(cmd, NULL, 0);
 }
 
 /* ---- PTT ---------------------------------------------------------- */
@@ -430,9 +831,13 @@ static void ptt_give_up(bt_ptt_state_t why)
     pthread_mutex_unlock(&S.lock);
 }
 
+/* MAC of the device transmitting, for ptt_watch(). Worker thread only. */
+static char tx_mac[32];
+
 /* Puts the headset into HFP if it is not there yet and returns the name
  * of its microphone source. The listening loopback, if running, is
- * moved over to the HFP sink. */
+ * moved over to the HFP sink. Only the device listening plays to (or
+ * the first headset/speaker) is touched - never a connected phone. */
 static bool ensure_hfp(char *mic, size_t mic_sz)
 {
     char card[96];
@@ -440,15 +845,24 @@ static bool ensure_hfp(char *mic, size_t mic_sz)
     bool relisten;
     int  i;
 
-    find_mic(mic, mic_sz);
+    mic[0] = '\0';
+    ptt_device(tx_mac, sizeof(tx_mac));
+    if (tx_mac[0] == '\0') {
+        bt_log("PTT: no headset or speaker connected");
+        return false;
+    }
+
+    find_mic(tx_mac, mic, mic_sz);
     if (mic[0] != '\0') {
         return true;
     }
 
-    find_card(card, sizeof(card));
+    find_card(tx_mac, card, sizeof(card));
     if (card[0] == '\0') {
+        bt_log("PTT: no card for %s", tx_mac);
         return false;
     }
+    bt_log("PTT: switching %s to HFP", card);
 
     /* The A2DP sink is about to vanish; take the listening loopback
      * down ourselves and bring it back on the HFP sink afterwards. */
@@ -466,12 +880,14 @@ static bool ensure_hfp(char *mic, size_t mic_sz)
     }
 
     for (i = 0; i < HFP_WAIT_STEPS; i++) {
-        find_mic(mic, mic_sz);
+        find_mic(tx_mac, mic, mic_sz);
         if (mic[0] != '\0') {
             break;
         }
         usleep(HFP_WAIT_US);
     }
+
+    bt_log("PTT: HFP microphone %s", mic[0] != '\0' ? mic : "NOT FOUND");
 
     if (relisten) {
         do_on();
@@ -494,11 +910,17 @@ static void do_ptt_on(void)
 
     unload_module(&S.tx_module_idx);
     idx = load_module_loopback(mic, TX_DEVICE, TX_LATENCY_MS, "BTMicTX");
+    bt_log("PTT: %s", idx >= 0 ? "TX on" : "FAILED to load TX loopback");
     if (idx < 0) {
         ptt_give_up(BT_PTT_FAILED);
         return;
     }
     S.tx_module_idx = idx;
+
+    /* Microphone level into the modulator for this transmission. */
+    pthread_mutex_lock(&S.lock);
+    audio_set_play_vol((float)S.mic_gain_db);
+    pthread_mutex_unlock(&S.lock);
 
     /* Audio path first, carrier last. */
     radio_set_modem(true);
@@ -512,6 +934,8 @@ static void do_ptt_on(void)
 
 static void do_ptt_off(bt_ptt_state_t final_state)
 {
+    bt_log("PTT: TX off%s", final_state == BT_PTT_TIMEOUT ? " (timeout)" :
+                            final_state == BT_PTT_NO_MIC ? " (microphone gone)" : "");
     set_ptt_state(BT_PTT_UNKEYING);
 
     /* Carrier first, audio path last. */
@@ -519,6 +943,9 @@ static void do_ptt_off(bt_ptt_state_t final_state)
     unload_module(&S.tx_module_idx);
 
     pthread_mutex_lock(&S.lock);
+    /* Back to the Play gain from Settings. Under the lock, so a Mic gain
+     * change racing with the unkey cannot leave the TX level behind. */
+    audio_set_play_vol(param_f_get(cfg.audio.play_gain_db()));
     S.ptt_on = false;
     S.tx_since = 0;
     S.ptt_state = final_state;
@@ -547,7 +974,7 @@ static void ptt_watch(void)
     /* Headset out of range or switched off: the TX loopback has already
      * unloaded itself (source_dont_move), so stop transmitting silence. */
     if ((++n % 2) == 0) {
-        find_mic(mic, sizeof(mic));
+        find_mic(tx_mac, mic, sizeof(mic));
         if (mic[0] == '\0') {
             S.tx_module_idx = -1;
             pthread_mutex_lock(&S.lock);
@@ -569,16 +996,23 @@ static void *worker(void *arg)
         bool  ptt_change;
         bool  want;
         bool  on;
+        bool  bg = false;
 
         pthread_mutex_lock(&S.lock);
-        while (!S.quit && S.cmd == CMD_NONE && S.ptt_want == S.ptt_on) {
-            if (S.ptt_on) {
+        while (!S.quit && S.cmd == CMD_NONE && S.ptt_want == S.ptt_on &&
+               !S.vol_pending &&
+               !(S.pause_want != S.pause_applied && S.module_idx >= 0)) {
+            bool watch = (S.state == BT_AUDIO_ON ||
+                          S.state == BT_AUDIO_NO_SINK);
+
+            if (S.ptt_on || watch) {
                 struct timespec ts;
 
                 clock_gettime(CLOCK_REALTIME, &ts);
-                ts.tv_sec += 1;
+                ts.tv_sec += S.ptt_on ? 1 : BG_POLL_S;
                 if (pthread_cond_timedwait(&S.cond, &S.lock, &ts)
                     == ETIMEDOUT) {
+                    bg = !S.ptt_on;
                     break;
                 }
             } else {
@@ -613,6 +1047,9 @@ static void *worker(void *arg)
             } else {
                 do_ptt_off(BT_PTT_OFF);
             }
+            speaker_follow();
+            apply_volume();
+            apply_pause();
             continue;
         }
 
@@ -629,16 +1066,28 @@ static void *worker(void *arg)
                 do_off();
                 break;
             case CMD_POLL:
-                do_poll();
+                do_poll(true);
                 break;
             default:
+                if (bg) {
+                    do_poll(false);
+                }
                 break;
         }
+
+        speaker_follow();
+        apply_volume();
+        apply_pause();
     }
 
     /* Never leave the transmitter keyed behind a dead thread. */
     if (S.ptt_on) {
         do_ptt_off(BT_PTT_OFF);
+    }
+    /* Nor the speaker silent. */
+    if (S.speaker_handed) {
+        S.speaker_handed = false;
+        radio_set_volume_sink(NULL);
     }
     return NULL;
 }
@@ -849,11 +1298,10 @@ bool bt_audio_headset_ptt(void)
  *
  * The headset sends no release, so the button is a toggle: press to
  * key, press again to unkey. BT_PTT_TIMEOUT_S still drops a forgotten
- * transmission. Every AT line seen goes to /tmp/bt_headset.log, which is
+ * transmission. Every AT line seen goes to /mnt/bt_audio.log, which is
  * how another headset's button would be found and added.
  */
 
-#define HS_LOG          "/tmp/bt_headset.log"
 #define HS_DEBOUNCE_MS  400u
 #define HS_REASM_MAX    1024u
 
@@ -884,13 +1332,7 @@ static uint64_t hs_now_ms(void)
 
 static void hs_log(const char *line, const char *what)
 {
-    FILE *f = fopen(HS_LOG, "a");
-
-    if (f == NULL) {
-        return;
-    }
-    fprintf(f, "%llu %s: %s\n", (unsigned long long)hs_now_ms(), line, what);
-    fclose(f);
+    bt_log("headset: %s: %s", line, what);
 }
 
 static void hs_toggle(const char *line)
@@ -956,11 +1398,61 @@ static void hs_at_line(const char *line)
         return;
     }
 
-    /* The rest of the HFP/HSP chatter (AT+VGS, AT+BRSF, ...): logged only
-     * when short, so the log stays readable. */
-    if (n > 0 && n < 64) {
+    /* The rest of the HFP/HSP chatter (AT+VGS, AT+BRSF, ...): all of it,
+     * an unknown headset's PTT button is found this way. */
+    if (n > 0) {
         hs_log(line, "-");
     }
+}
+
+/* AVRCP button from a headset: AVCTP header (transaction, packet type,
+ * C/R, IPID), PID 0x110E, then the AV/C frame: ctype, subunit 0x48
+ * (panel), opcode 0x7C (PASS THROUGH), operation id with bit 7 set on
+ * release. Logged only, so a headset whose PTT button speaks AVRCP (the
+ * Icom VS-3 sent no AT line at all) can be identified from the log. */
+static const char *avrcp_op_name(uint8_t op)
+{
+    switch (op) {
+        case 0x41: return "VOLUME_UP";
+        case 0x42: return "VOLUME_DOWN";
+        case 0x43: return "MUTE";
+        case 0x44: return "PLAY";
+        case 0x45: return "STOP";
+        case 0x46: return "PAUSE";
+        case 0x48: return "REWIND";
+        case 0x49: return "FAST_FORWARD";
+        case 0x4B: return "FORWARD";
+        case 0x4C: return "BACKWARD";
+        default:   return NULL;
+    }
+}
+
+static bool hs_avrcp(const uint8_t *p, size_t n)
+{
+    char        what[48];
+    const char *name;
+    uint8_t     op;
+
+    if (n < 7 || p[1] != 0x11 || p[2] != 0x0E) {
+        return false;
+    }
+    if ((p[0] & 0x02) != 0) {       /* a response, not a button */
+        return true;
+    }
+    if (p[4] != 0x48 || p[5] != 0x7C) {
+        return true;                /* other AVRCP traffic */
+    }
+    op = p[6] & 0x7F;
+    name = avrcp_op_name(op);
+    if (name != NULL) {
+        snprintf(what, sizeof(what), "AVRCP %s %s", name,
+                 (p[6] & 0x80) ? "released" : "pressed");
+    } else {
+        snprintf(what, sizeof(what), "AVRCP op 0x%02X %s", op,
+                 (p[6] & 0x80) ? "released" : "pressed");
+    }
+    bt_log("headset: %s", what);
+    return true;
 }
 
 /* A whole L2CAP frame from a device: look for AT lines in it. RFCOMM
@@ -968,9 +1460,16 @@ static void hs_at_line(const char *line)
  * up to CR is enough and needs no RFCOMM parsing. */
 static void hs_l2cap(const uint8_t *p, size_t n)
 {
+    if (hs_avrcp(p, n)) {
+        return;
+    }
+
     for (size_t i = 0; i + 3 <= n; i++) {
+        /* AT+..., AT*... and also ATA (answer) / ATD (dial): an HFP
+         * headset's button may send those instead. */
         if (p[i] != 'A' || p[i + 1] != 'T' ||
-            (p[i + 2] != '+' && p[i + 2] != '*')) {
+            (p[i + 2] != '+' && p[i + 2] != '*' &&
+             (p[i + 2] < 'A' || p[i + 2] > 'Z'))) {
             continue;
         }
 
@@ -1138,4 +1637,69 @@ static void headset_stop(void)
     H.quit = true;
     pthread_join(H.thread, NULL);
     H.thread_valid = false;
+}
+
+int bt_audio_mic_gain(void)
+{
+    int db;
+
+    ensure_thread();
+    pthread_mutex_lock(&S.lock);
+    db = S.mic_gain_db;
+    pthread_mutex_unlock(&S.lock);
+    return db;
+}
+
+int bt_audio_set_mic_gain(int db)
+{
+    ensure_thread();
+
+    if (db < MIC_GAIN_MIN) db = MIC_GAIN_MIN;
+    if (db > MIC_GAIN_MAX) db = MIC_GAIN_MAX;
+
+    pthread_mutex_lock(&S.lock);
+    S.mic_gain_db = db;
+    conf_save();
+    /* While transmitting the change is heard at once. */
+    if (S.ptt_on) {
+        audio_set_play_vol((float)db);
+    }
+    pthread_mutex_unlock(&S.lock);
+    return db;
+}
+
+bool bt_audio_playback_begin(char *sink, size_t sink_sz)
+{
+    bool on;
+
+    if (sink == NULL || sink_sz == 0) {
+        return false;
+    }
+    sink[0] = '\0';
+    if (!S.thread_valid) {
+        return false;
+    }
+
+    pthread_mutex_lock(&S.lock);
+    on = (S.state == BT_AUDIO_ON && S.sink[0] != '\0');
+    if (on) {
+        snprintf(sink, sink_sz, "%s", S.sink);
+        S.pause_want = true;
+        pthread_cond_signal(&S.cond);
+    }
+    pthread_mutex_unlock(&S.lock);
+    return on;
+}
+
+void bt_audio_playback_end(void)
+{
+    if (!S.thread_valid) {
+        return;
+    }
+    pthread_mutex_lock(&S.lock);
+    if (S.pause_want) {
+        S.pause_want = false;
+        pthread_cond_signal(&S.cond);
+    }
+    pthread_mutex_unlock(&S.lock);
 }
