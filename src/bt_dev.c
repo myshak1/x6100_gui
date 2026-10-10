@@ -56,7 +56,13 @@
 #define ADAPTER_PATH    "/org/bluez/hci0"
 #define AGENT_PATH      "/org/x6100/bt_agent"
 #define AGENT_CAP       "NoInputNoOutput"
+#define AGENT_CAP_KBD   "KeyboardDisplay"   /* only while pairing a keyboard */
 #define AGENT_PIN       "0000"
+
+/* Scan (or Connect on a device not paired yet) makes the radio visible
+ * and lets devices pair for this long; the rest of the time it is hidden
+ * and the agent refuses every pairing request. */
+#define PAIR_WINDOW_S   180
 
 #define PAIR_LOG        "/mnt/bt_pair.log"
 #define PAIR_LOG_MAX    262144
@@ -83,13 +89,18 @@ static struct {
     bt_dev_t        list[BT_DEV_MAX];
     int             count;
     bool            scanning;
-    char            activity[40];
+    char            activity[48];
+    time_t          open_until; /* pairing window, see pairing_open() */
+    char            agent_cap[20];
 
     GDBusConnection *conn;      /* worker thread only */
 } S = {
     .lock = PTHREAD_MUTEX_INITIALIZER,
     .cond = PTHREAD_COND_INITIALIZER,
 };
+
+static void agent_set_cap(const char *cap);
+static void agent_make_default(void);
 
 /* ---- Log ------------------------------------------------------------ */
 
@@ -280,6 +291,42 @@ static bool set_bool_prop(const char *path, const char *prop, bool val)
     return true;
 }
 
+static bool set_adapter_prop(const char *prop, GVariant *val)
+{
+    GVariant *r = call(ADAPTER_PATH, "org.freedesktop.DBus.Properties", "Set",
+                       g_variant_new("(ssv)", "org.bluez.Adapter1", prop, val),
+                       NULL, CALL_TIMEOUT_MS, NULL, 0);
+
+    if (r == NULL) {
+        return false;
+    }
+    g_variant_unref(r);
+    return true;
+}
+
+static bool get_adapter_bool(const char *prop)
+{
+    GVariant *r;
+    GVariant *v = NULL;
+    bool      val = false;
+
+    r = call(ADAPTER_PATH, "org.freedesktop.DBus.Properties", "Get",
+             g_variant_new("(ss)", "org.bluez.Adapter1", prop),
+             G_VARIANT_TYPE("(v)"), CALL_TIMEOUT_MS, NULL, 0);
+    if (r == NULL) {
+        return false;
+    }
+    g_variant_get(r, "(v)", &v);
+    if (v != NULL && g_variant_is_of_type(v, G_VARIANT_TYPE_BOOLEAN)) {
+        val = g_variant_get_boolean(v);
+    }
+    if (v != NULL) {
+        g_variant_unref(v);
+    }
+    g_variant_unref(r);
+    return val;
+}
+
 /* Device1 boolean property; false when the device is unknown, and then
  * *exists (if given) is false too. */
 static bool get_bool_prop(const char *addr, const char *prop, bool *exists)
@@ -325,12 +372,13 @@ static bool discovery(bool on)
     GVariant *r;
 
     if (on) {
-        /* Classic only: headsets and phones are BR/EDR, and BLE beacons
-         * would only fill the list. Errors here are harmless. */
+        /* Classic and LE: headsets and phones are BR/EDR, most keyboards
+         * sold now are LE only. do_refresh() keeps LE beacons out of the
+         * list. Errors here are harmless. */
         GVariantBuilder b;
 
         g_variant_builder_init(&b, G_VARIANT_TYPE("a{sv}"));
-        g_variant_builder_add(&b, "{sv}", "Transport", g_variant_new_string("bredr"));
+        g_variant_builder_add(&b, "{sv}", "Transport", g_variant_new_string("auto"));
         r = call(ADAPTER_PATH, "org.bluez.Adapter1", "SetDiscoveryFilter",
                  g_variant_new("(a{sv})", &b), NULL, CALL_TIMEOUT_MS, NULL, 0);
         if (r != NULL) {
@@ -364,17 +412,64 @@ static bool props_phone(guint32 cls, const char *icon)
            (icon != NULL && strcmp(icon, "phone") == 0);
 }
 
-/* Asks bluez over `c` whether the device at `path` is a phone. */
-static bool path_is_phone(GDBusConnection *c, const char *path)
+/* ---- Keyboards ----------------------------------------------------------
+ *
+ * A keyboard (or mouse) is told by its Class (major 0x05, peripheral),
+ * its Icon ("input-..."), its Appearance (0x03C0-0x03FF, HID) or the HID
+ * services it offers (0x1812 HID over GATT, 0x1124 classic HID). It is
+ * paired differently (see do_pair_connect()) and is left out of "one
+ * device at a time": it carries no audio and no SPP. */
+static bool uuids_input(GVariant *uuids)
+{
+    GVariantIter it;
+    const char  *u;
+
+    if (uuids == NULL || !g_variant_is_of_type(uuids, G_VARIANT_TYPE("as"))) {
+        return false;
+    }
+    g_variant_iter_init(&it, uuids);
+    while (g_variant_iter_next(&it, "&s", &u)) {
+        if (g_ascii_strncasecmp(u, "00001812", 8) == 0 ||
+            g_ascii_strncasecmp(u, "00001124", 8) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* `dev`: a Device1 property dictionary (a{sv}). */
+static bool props_input(GVariant *dev)
+{
+    guint32     cls = 0;
+    guint16     appearance = 0;
+    const char *icon = NULL;
+    GVariant   *uuids;
+    bool        input;
+
+    g_variant_lookup(dev, "Class", "u", &cls);
+    g_variant_lookup(dev, "Appearance", "q", &appearance);
+    g_variant_lookup(dev, "Icon", "&s", &icon);
+    input = ((cls >> 8) & 0x1F) == 0x05 ||
+            (appearance & 0xFFC0) == 0x03C0 ||
+            (icon != NULL && strncmp(icon, "input-", 6) == 0);
+    if (!input) {
+        uuids = g_variant_lookup_value(dev, "UUIDs", G_VARIANT_TYPE("as"));
+        input = uuids_input(uuids);
+        if (uuids != NULL) {
+            g_variant_unref(uuids);
+        }
+    }
+    return input;
+}
+
+/* Device1 properties of `path` asked over `c` (unref), or NULL. */
+static GVariant *dev_props(GDBusConnection *c, const char *path)
 {
     GVariant *r;
     GVariant *props;
-    guint32   cls = 0;
-    const char *icon = NULL;
-    bool      phone = false;
 
-    if (c == NULL) {
-        return false;
+    if (c == NULL || path == NULL) {
+        return NULL;
     }
     r = g_dbus_connection_call_sync(c, BLUEZ, path,
                                     "org.freedesktop.DBus.Properties", "GetAll",
@@ -383,15 +478,103 @@ static bool path_is_phone(GDBusConnection *c, const char *path)
                                     G_DBUS_CALL_FLAGS_NONE, CALL_TIMEOUT_MS,
                                     NULL, NULL);
     if (r == NULL) {
-        return false;
+        return NULL;
     }
     props = g_variant_get_child_value(r, 0);
+    g_variant_unref(r);
+    return props;
+}
+
+/* Asks bluez over `c` whether the device at `path` is a phone. */
+static bool path_is_phone(GDBusConnection *c, const char *path)
+{
+    GVariant   *props = dev_props(c, path);
+    guint32     cls = 0;
+    const char *icon = NULL;
+    bool        phone;
+
+    if (props == NULL) {
+        return false;
+    }
     g_variant_lookup(props, "Class", "u", &cls);
     g_variant_lookup(props, "Icon", "&s", &icon);
     phone = props_phone(cls, icon);
     g_variant_unref(props);
-    g_variant_unref(r);
     return phone;
+}
+
+/* ... and whether it is a keyboard or another input device. */
+static bool path_is_input(GDBusConnection *c, const char *path)
+{
+    GVariant *props = dev_props(c, path);
+    bool      input;
+
+    if (props == NULL) {
+        return false;
+    }
+    input = props_input(props);
+    g_variant_unref(props);
+    return input;
+}
+
+/* Paired with this radio (bluez has its key)? */
+static bool path_is_paired(GDBusConnection *c, const char *path)
+{
+    GVariant *props = dev_props(c, path);
+    gboolean  paired = FALSE;
+
+    if (props == NULL) {
+        return false;
+    }
+    g_variant_lookup(props, "Paired", "b", &paired);
+    g_variant_unref(props);
+    return paired;
+}
+
+/* ---- Pairing window ------------------------------------------------------
+ *
+ * The radio has no screen of its own for pairing questions, and an agent
+ * that accepts everything all the time let anyone in range pair with it.
+ * So pairing is open only for PAIR_WINDOW_S after Scan (or after Connect
+ * on a device that still has to be paired): the adapter is discoverable
+ * and pairable for that time, and the agent accepts pairing requests only
+ * then. Devices already paired connect as before at any time. */
+static bool pairing_is_open(void)
+{
+    bool open;
+
+    pthread_mutex_lock(&S.lock);
+    open = time(NULL) < S.open_until;
+    pthread_mutex_unlock(&S.lock);
+    return open;
+}
+
+/* Worker thread. */
+static void pairing_open(void)
+{
+    pthread_mutex_lock(&S.lock);
+    S.open_until = time(NULL) + PAIR_WINDOW_S;
+    pthread_mutex_unlock(&S.lock);
+
+    (void)set_adapter_prop("Pairable", g_variant_new_boolean(TRUE));
+    (void)set_adapter_prop("DiscoverableTimeout", g_variant_new_uint32(PAIR_WINDOW_S));
+    (void)set_adapter_prop("Discoverable", g_variant_new_boolean(TRUE));
+    plog("pairing open: visible and pairable for %d s", PAIR_WINDOW_S);
+}
+
+/* Worker thread, on every refresh: once the window is over, hidden and
+ * not pairable again - also against bt_start.sh, which makes the adapter
+ * discoverable for good at boot. */
+static void pairing_enforce(void)
+{
+    if (pairing_is_open()) {
+        return;
+    }
+    if (get_adapter_bool("Discoverable") || get_adapter_bool("Pairable")) {
+        (void)set_adapter_prop("Discoverable", g_variant_new_boolean(FALSE));
+        (void)set_adapter_prop("Pairable", g_variant_new_boolean(FALSE));
+        plog("pairing closed: hidden, not pairable (Scan opens it again)");
+    }
 }
 
 static void do_refresh(void)
@@ -422,8 +605,9 @@ static void do_refresh(void)
             gboolean    paired = FALSE;
             gboolean    connected = FALSE;
             gboolean    blocked = FALSE;
-            guint32     cls = 0;
-            const char *icon = NULL;
+            gboolean    has_class;
+            GVariant   *cls_v;
+            bool        input;
             bt_dev_t    d;
 
             dev = g_variant_lookup_value(ifaces, "org.bluez.Device1",
@@ -437,11 +621,20 @@ static void do_refresh(void)
                 g_variant_lookup(dev, "Paired", "b", &paired);
                 g_variant_lookup(dev, "Connected", "b", &connected);
                 g_variant_lookup(dev, "Blocked", "b", &blocked);
-                g_variant_lookup(dev, "Class", "u", &cls);
-                g_variant_lookup(dev, "Icon", "&s", &icon);
+                /* Class comes only from a classic (BR/EDR) inquiry. A
+                 * device seen only over LE is listed only when it is a
+                 * keyboard or other input device: the rest are beacons,
+                 * watches, TVs. */
+                cls_v = g_variant_lookup_value(dev, "Class", NULL);
+                has_class = (cls_v != NULL);
+                if (cls_v != NULL) {
+                    g_variant_unref(cls_v);
+                }
+                input = props_input(dev);
 
                 if (addr != NULL && addr_ok(addr) &&
-                    (name != NULL || paired || connected)) {
+                    (paired || connected ||
+                     (name != NULL && (has_class || input)))) {
                     memset(&d, 0, sizeof(d));
                     snprintf(d.addr, sizeof(d.addr), "%s", addr);
                     /* "(off)": Blocked, see make_exclusive() - Connect
@@ -452,6 +645,7 @@ static void do_refresh(void)
                         snprintf(d.name, sizeof(d.name), "%s", name ? name : addr);
                     }
                     d.connected = connected;
+                    d.input = input;
                     /* Paired and connected first, then what a scan found. */
                     if ((paired || connected) && n < BT_DEV_MAX) {
                         tmp[n++] = d;
@@ -502,6 +696,15 @@ static void do_refresh(void)
     memcpy(S.list, tmp, sizeof(tmp));
     S.count = n;
     pthread_mutex_unlock(&S.lock);
+
+    pairing_enforce();
+    {
+        static unsigned n_refresh;
+
+        if ((n_refresh++ % 10) == 0) {
+            agent_make_default();
+        }
+    }
 }
 
 /* ---- Pair / connect ------------------------------------------------------ */
@@ -541,44 +744,88 @@ static bool connect_dev(const char *path)
     return false;
 }
 
+/* Wait for a device to (re)appear in an inquiry; true when it is there. */
+static bool wait_known(const char *addr, bool *scanned)
+{
+    int i;
+
+    *scanned = discovery(true);
+    plog("discovery %s, waiting up to %d s", *scanned ? "on" : "FAILED", PAIR_FIND_S);
+    for (i = 0; i < PAIR_FIND_S && !device_known(addr); i++) {
+        sleep(1);
+    }
+    if (!device_known(addr)) {
+        return false;
+    }
+    plog("found after %d s", i);
+    return true;
+}
+
 static pair_result_t do_pair_connect(const char *addr)
 {
     char      path[64];
     char      en[96];
     GVariant *r;
     bool      scanned = false;
-    int       i;
+    bool      input;
 
     dev_path(addr, path, sizeof(path));
     plog("=== pair %s", addr);
+    pairing_open();
 
-    /* The device must be known to bluez. A Scan a moment ago leaves it
-     * there for a while; otherwise look for it now (pairing mode). */
-    if (!device_known(addr)) {
-        set_activity("searching...");
-        scanned = discovery(true);
-        plog("not known yet, discovery %s, waiting up to %d s",
-             scanned ? "on" : "FAILED", PAIR_FIND_S);
-        for (i = 0; i < PAIR_FIND_S && !device_known(addr); i++) {
-            sleep(1);
+    input = device_known(addr) && path_is_input(bus(), path);
+    if (input) {
+        /* Many keyboards accept a pairing only for a few seconds after
+         * their pairing key is pressed, and an entry left from an earlier
+         * Scan says nothing about whether that is now. So the old entry
+         * goes, and Pair() is sent the moment the keyboard shows up
+         * again. */
+        r = call(ADAPTER_PATH, "org.bluez.Adapter1", "RemoveDevice",
+                 g_variant_new("(o)", path), NULL, CALL_TIMEOUT_MS, NULL, 0);
+        if (r != NULL) {
+            g_variant_unref(r);
         }
-        if (!device_known(addr)) {
+        set_activity("Press the keyboard's pairing key");
+        plog("keyboard: waiting for it to advertise again");
+        if (!wait_known(addr, &scanned)) {
+            plog("result: keyboard not found - pairing key pressed?");
+            if (scanned) {
+                discovery(false);
+            }
+            return PAIR_NOT_FOUND;
+        }
+    } else if (!device_known(addr)) {
+        /* The device must be known to bluez. A Scan a moment ago leaves it
+         * there for a while; otherwise look for it now (pairing mode). */
+        set_activity("searching...");
+        if (!wait_known(addr, &scanned)) {
             plog("result: not found - is the headset in pairing mode?");
             if (scanned) {
                 discovery(false);
             }
             return PAIR_NOT_FOUND;
         }
-        plog("found after %d s", i);
+        input = path_is_input(bus(), path);
     }
     /* An inquiry running alongside slows paging and pairing down. */
     if (scanned) {
         discovery(false);
     }
 
+    /* A keyboard often pairs with passkey entry: the radio shows a number
+     * (DisplayPasskey, see the agent), the operator types it on the
+     * keyboard. bluez offers that only to an agent that can display, and
+     * only for this pairing: headsets and phones stay with the Just Works
+     * pairing that works with them. */
+    if (input) {
+        agent_set_cap(AGENT_CAP_KBD);
+    }
     set_activity("pairing...");
     r = call(path, "org.bluez.Device1", "Pair", NULL, NULL, PAIR_TIMEOUT_MS,
              en, sizeof(en));
+    if (input) {
+        agent_set_cap(AGENT_CAP);
+    }
     if (r != NULL) {
         g_variant_unref(r);
         plog("Pair: ok");
@@ -603,7 +850,7 @@ static pair_result_t do_pair_connect(const char *addr)
         plog("result: connect failed");
         return PAIR_CONNECT_FAILED;
     }
-    plog("result: connected");
+    plog("result: connected%s", input ? " (keyboard)" : "");
     return PAIR_OK;
 }
 
@@ -619,7 +866,9 @@ static pair_result_t do_pair_connect(const char *addr)
  *                 reconnects), X is unblocked and connected;
  *   Disconnect X  X is Blocked, so it stays away until Connect.
  * Blocked is stored by bluez and survives a restart: after power-up only
- * the device used last comes back. Forget clears it with the pairing. */
+ * the device used last comes back. Forget clears it with the pairing.
+ * Keyboards are left out both ways: they carry no audio and no SPP, and
+ * connecting one blocks nothing. */
 static void set_blocked(const char *dev_addr, bool blocked)
 {
     char path[64];
@@ -630,7 +879,7 @@ static void set_blocked(const char *dev_addr, bool blocked)
     }
 }
 
-static void make_exclusive(const char *addr)
+static void make_exclusive(const char *addr, bool input)
 {
     GVariant     *r;
     GVariantIter *objs = NULL;
@@ -638,6 +887,10 @@ static void make_exclusive(const char *addr)
     GVariant     *ifaces;
     bool          dropped = false;
 
+    if (input) {
+        set_blocked(addr, false);
+        return;
+    }
     r = call("/", "org.freedesktop.DBus.ObjectManager", "GetManagedObjects",
              NULL, G_VARIANT_TYPE("(a{oa{sa{sv}}})"), CALL_TIMEOUT_MS, NULL, 0);
     if (r != NULL) {
@@ -657,7 +910,7 @@ static void make_exclusive(const char *addr)
                 g_variant_lookup(dev, "Blocked", "b", &blocked);
                 if (other != NULL && addr_ok(other) &&
                     g_ascii_strcasecmp(other, addr) != 0 &&
-                    (paired || connected) && !blocked) {
+                    (paired || connected) && !blocked && !props_input(dev)) {
                     set_blocked(other, true);
                     dropped = dropped || connected;
                 }
@@ -684,9 +937,11 @@ static void do_connect(const char *addr, bool connect)
     dev_path(addr, path, sizeof(path));
 
     if (connect) {
+        bool input = path_is_input(bus(), path);
+
         set_activity("connecting...");
-        plog("=== connect %s (others get blocked)", addr);
-        make_exclusive(addr);
+        plog("=== connect %s%s", addr, input ? " (keyboard)" : " (others get blocked)");
+        make_exclusive(addr, input);
 
         /* Pair first when needed. The button says Connect because that
          * is what the operator wants; pairing is plumbing. It needs the
@@ -802,6 +1057,8 @@ static void do_scan(void)
     S.scanning = true;
     pthread_mutex_unlock(&S.lock);
     set_activity("scanning...");
+    /* Scan is also how a phone gets to pair from its side. */
+    pairing_open();
 
     if (discovery(true)) {
         /* Refresh along the way so devices appear as they are found. */
@@ -867,31 +1124,116 @@ static const char AGENT_XML[] =
     " </interface>"
     "</node>";
 
+static void agent_refuse(GDBusMethodInvocation *inv, const char *method)
+{
+    plog("agent: refused %s - pairing is closed (press Scan to open it)", method);
+    g_dbus_method_invocation_return_dbus_error(inv, "org.bluez.Error.Rejected",
+                                               "Pairing closed - press Scan on the radio");
+}
+
+/* A code for a legacy (PIN) keyboard: typed on it, so not "0000". */
+static void random_pin(char *out, size_t out_sz)
+{
+    unsigned v = 0;
+    FILE    *f = fopen("/dev/urandom", "rb");
+
+    if (f == NULL || fread(&v, sizeof(v), 1, f) != 1) {
+        v = (unsigned)time(NULL) * 2654435761u;
+    }
+    if (f != NULL) {
+        fclose(f);
+    }
+    snprintf(out, out_sz, "%06u", v % 1000000u);
+}
+
+/* Runs on the agent thread. Pairing questions are answered only while the
+ * pairing window is open (see pairing_open()); then:
+ *   RequestPinCode       "0000" (older headsets), a random code shown in
+ *                        the window for a keyboard (typed on it)
+ *   DisplayPasskey/PinCode  shown in the window: type it on the keyboard
+ *   RequestPasskey       0 (nothing to type it on)
+ *   RequestConfirmation, RequestAuthorization  accepted (no keypad)
+ * AuthorizeService is accepted for a paired device at any time. */
 static void agent_call(GDBusConnection *c, const gchar *sender,
                        const gchar *obj, const gchar *iface,
                        const gchar *method, GVariant *params,
                        GDBusMethodInvocation *inv, gpointer user)
 {
+    const char *dev = NULL;
+    char        text[48];
+
     (void)c; (void)sender; (void)obj; (void)iface; (void)user;
 
     if (g_variant_n_children(params) > 0) {
         GVariant *v = g_variant_get_child_value(params, 0);
 
-        plog("agent: %s %s", method,
-             g_variant_is_of_type(v, G_VARIANT_TYPE_OBJECT_PATH)
-                 ? g_variant_get_string(v, NULL) : "");
-        g_variant_unref(v);
+        if (g_variant_is_of_type(v, G_VARIANT_TYPE_OBJECT_PATH)) {
+            dev = g_variant_get_string(v, NULL);
+        }
+        plog("agent: %s %s", method, dev ? dev : "");
+        g_variant_unref(v);     /* dev stays valid: params holds it */
     } else {
         plog("agent: %s", method);
     }
 
+    if (strcmp(method, "AuthorizeService") == 0) {
+        if (pairing_is_open() || path_is_paired(A.conn, dev)) {
+            g_dbus_method_invocation_return_value(inv, NULL);
+        } else {
+            agent_refuse(inv, method);
+        }
+        return;
+    }
+    if (strcmp(method, "Release") == 0) {
+        g_dbus_method_invocation_return_value(inv, NULL);
+        return;
+    }
+    if (strcmp(method, "Cancel") == 0) {
+        pthread_mutex_lock(&S.lock);
+        if (strncmp(S.activity, "Type ", 5) == 0) {
+            S.activity[0] = '\0';
+        }
+        pthread_mutex_unlock(&S.lock);
+        g_dbus_method_invocation_return_value(inv, NULL);
+        return;
+    }
+    if (!pairing_is_open()) {
+        agent_refuse(inv, method);
+        return;
+    }
+
     if (strcmp(method, "RequestPinCode") == 0) {
-        g_dbus_method_invocation_return_value(inv, g_variant_new("(s)", AGENT_PIN));
+        if (path_is_input(A.conn, dev)) {
+            char pin[8];
+
+            random_pin(pin, sizeof(pin));
+            snprintf(text, sizeof(text), "Type %s on the keyboard, Enter", pin);
+            set_activity(text);
+            plog("agent: PIN %s for the keyboard", pin);
+            g_dbus_method_invocation_return_value(inv, g_variant_new("(s)", pin));
+        } else {
+            g_dbus_method_invocation_return_value(inv, g_variant_new("(s)", AGENT_PIN));
+        }
+    } else if (strcmp(method, "DisplayPinCode") == 0) {
+        const char *pin = NULL;
+
+        g_variant_get(params, "(&o&s)", NULL, &pin);
+        snprintf(text, sizeof(text), "Type %.8s on the keyboard, Enter", pin ? pin : "?");
+        set_activity(text);
+        g_dbus_method_invocation_return_value(inv, NULL);
+    } else if (strcmp(method, "DisplayPasskey") == 0) {
+        guint32 passkey = 0;
+        guint16 entered = 0;
+
+        g_variant_get(params, "(&ouq)", NULL, &passkey, &entered);
+        snprintf(text, sizeof(text), "Type %06u on the keyboard, Enter", (unsigned)passkey);
+        set_activity(text);
+        plog("agent: passkey %06u (%u typed)", (unsigned)passkey, (unsigned)entered);
+        g_dbus_method_invocation_return_value(inv, NULL);
     } else if (strcmp(method, "RequestPasskey") == 0) {
         g_dbus_method_invocation_return_value(inv, g_variant_new("(u)", 0u));
     } else {
-        /* Release, Display*, RequestConfirmation, RequestAuthorization,
-         * AuthorizeService, Cancel: accept / acknowledge. */
+        /* RequestConfirmation, RequestAuthorization: accept. */
         g_dbus_method_invocation_return_value(inv, NULL);
     }
 }
@@ -902,10 +1244,18 @@ static void agent_register(void)
 {
     GError   *err = NULL;
     GVariant *r;
+    char      cap[20];
+
+    if (A.conn == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&S.lock);
+    snprintf(cap, sizeof(cap), "%s", S.agent_cap[0] ? S.agent_cap : AGENT_CAP);
+    pthread_mutex_unlock(&S.lock);
 
     r = g_dbus_connection_call_sync(A.conn, BLUEZ, "/org/bluez",
                                     "org.bluez.AgentManager1", "RegisterAgent",
-                                    g_variant_new("(os)", AGENT_PATH, AGENT_CAP),
+                                    g_variant_new("(os)", AGENT_PATH, cap),
                                     NULL, G_DBUS_CALL_FLAGS_NONE, CALL_TIMEOUT_MS,
                                     NULL, &err);
     if (r == NULL) {
@@ -926,7 +1276,54 @@ static void agent_register(void)
         return;
     }
     g_variant_unref(r);
-    plog("agent: registered (%s, PIN %s)", AGENT_CAP, AGENT_PIN);
+    plog("agent: registered (%s, PIN %s)", cap, AGENT_PIN);
+}
+
+/* Default agent again: bt_start.sh's bt-agent (accepts everything) takes
+ * that place when it starts after us, e.g. when the adapter comes back. */
+static void agent_make_default(void)
+{
+    GVariant *r;
+
+    if (A.conn == NULL) {
+        return;
+    }
+    r = g_dbus_connection_call_sync(A.conn, BLUEZ, "/org/bluez",
+                                    "org.bluez.AgentManager1", "RequestDefaultAgent",
+                                    g_variant_new("(o)", AGENT_PATH),
+                                    NULL, G_DBUS_CALL_FLAGS_NONE, CALL_TIMEOUT_MS,
+                                    NULL, NULL);
+    if (r != NULL) {
+        g_variant_unref(r);
+    }
+}
+
+/* Worker thread: register again with another IO capability. bluez reads
+ * it when a pairing starts. */
+static void agent_set_cap(const char *cap)
+{
+    GVariant *r;
+
+    pthread_mutex_lock(&S.lock);
+    if (strcmp(S.agent_cap[0] ? S.agent_cap : AGENT_CAP, cap) == 0) {
+        pthread_mutex_unlock(&S.lock);
+        return;
+    }
+    snprintf(S.agent_cap, sizeof(S.agent_cap), "%s", cap);
+    pthread_mutex_unlock(&S.lock);
+
+    if (A.conn == NULL) {
+        return;
+    }
+    r = g_dbus_connection_call_sync(A.conn, BLUEZ, "/org/bluez",
+                                    "org.bluez.AgentManager1", "UnregisterAgent",
+                                    g_variant_new("(o)", AGENT_PATH),
+                                    NULL, G_DBUS_CALL_FLAGS_NONE, CALL_TIMEOUT_MS,
+                                    NULL, NULL);
+    if (r != NULL) {
+        g_variant_unref(r);
+    }
+    agent_register();
 }
 
 static void bluez_appeared(GDBusConnection *c, const gchar *name,
@@ -1213,4 +1610,14 @@ bool bt_dev_scanning(void)
 const char *bt_dev_activity(void)
 {
     return S.activity;
+}
+
+int bt_dev_visible_s(void)
+{
+    time_t left;
+
+    pthread_mutex_lock(&S.lock);
+    left = S.open_until - time(NULL);
+    pthread_mutex_unlock(&S.lock);
+    return left > 0 ? (int)left : 0;
 }

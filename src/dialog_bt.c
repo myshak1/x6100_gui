@@ -26,6 +26,11 @@
  *  Mic gain: press +1 dB, hold -1 dB. Set it so the ALC just moves on
  *  voice peaks while transmitting from the headset.
  *
+ *  Scan opens pairing for 3 minutes: the radio is visible and a phone
+ *  can pair from its side; the rest of the time it is hidden and refuses
+ *  pairing. A keyboard: press its pairing key, then Connect, and type
+ *  the code shown here if it asks for one.
+ *
  *  Pairing is part of Connect (bt_dev pairs first when needed). Forget
  *  removes the pairing; it acts on hold only, a press just says so.
  *
@@ -171,7 +176,7 @@ static lv_obj_t   *label_audio = NULL;
 static lv_timer_t *timer_status = NULL;
 static uint32_t    tick = 0;
 static bool        udp_on = false;   /* cached ft8_udp_is_enabled() */
-static char        last_activity[40];
+static char        last_activity[48];
 
 /* ---- Table ------------------------------------------------------------- */
 
@@ -213,7 +218,7 @@ static void table_refresh(void)
         snprintf(buf, sizeof(buf), "%s%s%s",
                  dev.connected ? "* " : "  ",
                  dev.name,
-                 dev.audio ? "  [audio]" : "");
+                 dev.audio ? "  [audio]" : dev.input ? "  [kbd]" : "");
         lv_table_set_cell_value(table, (uint16_t)i, 0, buf);
     }
 }
@@ -252,11 +257,18 @@ static void status_refresh(void)
         case BT_CTL_FAILED:
             lv_label_set_text(label_adapter, "Failed");
             break;
-        case BT_CTL_ON:
-            lv_label_set_text_fmt(label_adapter, "%s\n%s", bt_ctl_addr(),
-                                  bt_ctl_discoverable() ? "Discoverable"
-                                                        : "Hidden");
+        case BT_CTL_ON: {
+            /* Visible and pairable only for a few minutes after Scan. */
+            int left = bt_dev_visible_s();
+
+            if (left > 0) {
+                lv_label_set_text_fmt(label_adapter, "%s\nPairing %d:%02d",
+                                      bt_ctl_addr(), left / 60, left % 60);
+            } else {
+                lv_label_set_text_fmt(label_adapter, "%s\nHidden", bt_ctl_addr());
+            }
             break;
+        }
         default:
             /* WiFi off in the WiFi window cuts power to the shared
              * WiFi/BT chip; BT On powers it up again. */
@@ -355,8 +367,12 @@ static void status_timer_cb(lv_timer_t *t)
     if (strcmp(bt_dev_activity(), last_activity) != 0) {
         snprintf(last_activity, sizeof(last_activity), "%s",
                  bt_dev_activity());
-        if (strcmp(last_activity, "Not found") == 0) {
-            msg_update_text_fmt("Headset not found - pairing mode?");
+        if (strncmp(last_activity, "Type ", 5) == 0 ||
+            strncmp(last_activity, "Press the keyboard", 18) == 0) {
+            /* Keyboard pairing: the code to type, or the pairing key. */
+            msg_update_text_fmt("%s", last_activity);
+        } else if (strcmp(last_activity, "Not found") == 0) {
+            msg_update_text_fmt("Not found - is it in pairing mode?");
         } else if (strcmp(last_activity, "Pairing failed") == 0) {
             msg_update_text_fmt("Pairing failed - headset in pairing mode?");
         } else if (strcmp(last_activity, "Connect failed") == 0) {
@@ -541,7 +557,7 @@ static void scan_cb(button_data_t *item)
     }
 
     bt_dev_scan();
-    msg_update_text_fmt("Scanning for devices");
+    msg_update_text_fmt("Scanning - pairing open for 3 min (a phone can pair now)");
     buttons_refresh(item);
 }
 
