@@ -1,4 +1,7 @@
 /*
+ *  SPDX-License-Identifier: LGPL-2.1-or-later
+ *  Copyright (c) 2026 Krzysztof Myszkowski SP2KMO
+ *
  * bt_audio.h - Bluetooth headset audio: listening and PTT.
  *
  * Listening: a PulseAudio loopback from the radio's capture device to

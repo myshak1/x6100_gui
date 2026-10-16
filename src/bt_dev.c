@@ -1,4 +1,7 @@
 /*
+ *  SPDX-License-Identifier: LGPL-2.1-or-later
+ *  Copyright (c) 2026 Krzysztof Myszkowski SP2KMO
+ *
  * bt_dev.c - known Bluetooth devices: list, scan, pair, connect, forget.
  *
  * Everything goes straight to BlueZ over D-Bus, as bt.cpp on the

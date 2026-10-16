@@ -1,4 +1,7 @@
 /*
+ *  SPDX-License-Identifier: LGPL-2.1-or-later
+ *  Copyright (c) 2026 Krzysztof Myszkowski SP2KMO
+ *
  * bt_spp.h - Bluetooth SPP (RFCOMM) frame server.
  *
  * Carries the same WSJT-X datagrams that ft8_udp sends over UDP, so a

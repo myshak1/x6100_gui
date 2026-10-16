@@ -1,4 +1,7 @@
 /*
+ *  SPDX-License-Identifier: LGPL-2.1-or-later
+ *  Copyright (c) 2026 Krzysztof Myszkowski SP2KMO
+ *
  * bt_dev.h - known Bluetooth devices, for the table in dialog_bt.
  *
  * Everything goes to BlueZ over D-Bus on a worker thread (pairing can

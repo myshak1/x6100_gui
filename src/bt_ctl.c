@@ -1,4 +1,7 @@
 /*
+ *  SPDX-License-Identifier: LGPL-2.1-or-later
+ *  Copyright (c) 2026 Krzysztof Myszkowski SP2KMO
+ *
  * bt_ctl.c - power and discoverability for the built-in Bluetooth adapter.
  *
  * Bring-up is done by /usr/bin/bt_up.sh (rootfs overlay) rather than in

@@ -1,4 +1,7 @@
 /*
+ *  SPDX-License-Identifier: LGPL-2.1-or-later
+ *  Copyright (c) 2026 Krzysztof Myszkowski SP2KMO
+ *
  * bt_spp.c - Bluetooth SPP (RFCOMM) frame server for the X6100 GUI.
  *
  * Wire format, one frame per datagram:
