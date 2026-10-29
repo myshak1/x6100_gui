@@ -339,6 +339,8 @@ static button_data_t  btn_wefax  = make_app_btn("WeFax", ACTION_APP_WEFAX);
 static button_data_t  btn_sstv   = make_app_btn("SSTV", ACTION_APP_SSTV);
 /* Channels */
 static button_data_t  btn_channels = make_action_btn("Channels", ACTION_APP_CHANNELS);
+/* JTTY */
+static button_data_t  btn_jtty   = make_app_btn("JTTY", ACTION_APP_JTTY);
 
 /* RTTY */
 static button_data_t btn_rtty_p1 = {
@@ -475,7 +477,7 @@ static buttons_page_t page_app_3 = {
     {&btn_app_p3, &btn_wifi, &btn_bt, &btn_js8, &btn_wefax}
 };
 static buttons_page_t page_app_4 = {
-    {&btn_app_p4, &btn_sstv, &btn_channels}
+    {&btn_app_p4, &btn_sstv, &btn_channels, &btn_jtty}
 };
 
 /* RTTY */

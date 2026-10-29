@@ -38,6 +38,8 @@ typedef enum {
     MODE_FT4,
     MODE_RTTY,
     MODE_JS8 = 8,       /* stored in qso_log.db: never reused or changed */
+    /* 9: FT2 (#288) */
+    MODE_JTTY = 10,     /* ADIF MODE "JTTY", as WSJT-X writes it */
 } qso_log_mode_t;
 
 typedef struct {

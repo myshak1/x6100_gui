@@ -1,6 +1,7 @@
 /*
- *  SPDX-License-Identifier: LGPL-2.1-or-later
+ *  SPDX-License-Identifier: GPL-3.0-or-later
  *  Copyright (c) 2026 Krzysztof Myszkowski SP2KMO
+ *  Part of OpenX6100 (github.com/OpenX6100)
  *
  *  Xiegu X6100 LVGL GUI - JTTY window
  *
@@ -139,7 +140,7 @@ typedef struct {
 static void construct_cb(lv_obj_t *parent);
 static void destruct_cb(void);
 static void key_cb(lv_event_t *e);
-static void rotary_cb(int32_t diff);
+static void rotary_cb(int32_t diff, uint16_t dt);
 static void band_cb(lv_event_t *e);
 static void clear_cb(button_data_t *b);
 static void log_cb(button_data_t *b);
@@ -1268,7 +1269,7 @@ static void clear_cb(button_data_t *b)
 }
 
 /* Main knob: our transmit offset. */
-static void rotary_cb(int32_t diff)
+static void rotary_cb(int32_t diff, uint16_t dt)
 {
     marker_hz += diff * MARKER_STEP_HZ;
     if (marker_hz < WSJTX_LOW_HZ) {
