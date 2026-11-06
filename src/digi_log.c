@@ -92,6 +92,8 @@ void digi_log_from_qso(digi_log_qso_t *q, digi_log_mode_t mode, const char *subm
     snprintf(q->qth, sizeof(q->qth), "%s", digi_qso_qth());
     snprintf(q->rst_sent, sizeof(q->rst_sent), "%s", digi_qso_rst_sent());
     snprintf(q->rst_rcvd, sizeof(q->rst_rcvd), "%s", digi_qso_rst_rcvd());
+    q->stx = digi_qso_serial_sent();
+    snprintf(q->srx, sizeof(q->srx), "%s", digi_qso_serial_rcvd());
     q->end = time(NULL);
     q->start = digi_qso_start();
     if (q->start > q->end) {
@@ -120,6 +122,7 @@ size_t digi_log_adif(char *out, size_t size, const digi_log_qso_t *q, const char
     char      date_on[40], time_on[40], date_off[40], time_off[40];
     char      freq[24];
     char      pwr[12];
+    char      stx[12];
     size_t    o = 0;
     int       n;
 
@@ -143,6 +146,9 @@ size_t digi_log_adif(char *out, size_t size, const digi_log_qso_t *q, const char
     adif_add(out, size, &o, "submode", adif_submode(q));
     adif_add(out, size, &o, "rst_sent", q->rst_sent);
     adif_add(out, size, &o, "rst_rcvd", q->rst_rcvd);
+    snprintf(stx, sizeof(stx), "%d", q->stx);
+    adif_add(out, size, &o, "stx", q->stx > 0 ? stx : "");
+    adif_add(out, size, &o, "srx", q->srx);
     adif_add(out, size, &o, "qso_date", date_on);
     adif_add(out, size, &o, "time_on", time_on);
     adif_add(out, size, &o, "qso_date_off", date_off);
@@ -230,7 +236,13 @@ bool digi_log_current(digi_log_mode_t mode, const char *submode, uint64_t freq_h
         return false;
     }
     digi_qso_set_logged(true);
-    msg_update_text_fmt("#FFFFFF Logged %s  %s / %s%s%s", q.call, q.rst_sent, q.rst_rcvd,
-                        q.name[0] ? "  " : "", q.name);
+    digi_qso_logged_serial();
+    if (q.stx > 0 || q.srx[0]) {
+        msg_update_text_fmt("#FFFFFF Logged %s  %s %03d / %s %s", q.call, q.rst_sent, q.stx,
+                            q.rst_rcvd, q.srx[0] ? q.srx : "-");
+    } else {
+        msg_update_text_fmt("#FFFFFF Logged %s  %s / %s%s%s", q.call, q.rst_sent, q.rst_rcvd,
+                            q.name[0] ? "  " : "", q.name);
+    }
     return true;
 }
